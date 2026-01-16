@@ -254,6 +254,7 @@ NETNODE_NAME = "$hashdb"
 # Variables for async operations
 HASHDB_REQUEST_TIMEOUT = 15 # Limit to 15 seconds
 HASHDB_REQUEST_LOCK = threading.Lock()
+IMPORTED_MODULES = set() 
 
 #--------------------------------------------------------------------------
 # Setup Icon
@@ -898,7 +899,7 @@ class unqualified_name_replace_t(ida_kernwin.Form):
                "{form_change_callback}\n" \
                "Some of the characters in the hashed string are invalid (highlighted red):\n" \
                "{unqualified_name}\n" \
-               "<##New name\: :{new_name}>"
+               "<##New name\\: :{new_name}>"
         
         invalid_characters_html = "<span style=\"font-size: 16px\">{}</span>"
         controls = {
@@ -1105,23 +1106,38 @@ def generate_enum_name(prefix: str) -> str:
     return prefix + '_' + HASHDB_ALGORITHM
 
 
-def make_const_enum(enum_id, hash_value):
-    # We are in the disassembler we can set the enum directly
-    ea = idc.here()
-    start = idaapi.get_item_head(ea)
-    # Determind if this is code or data/undefined
-    if idc.is_code(idc.get_full_flags(ea)):
-        # Find the operand position
-        if idc.get_operand_value(ea,0) == hash_value:
-            ida_bytes.op_enum(start, 0, enum_id, 0)
-            return True
-        elif idc.get_operand_value(ea,1) == hash_value:
-            ida_bytes.op_enum(start, 1, enum_id, 0)
-            return True
-        else:
-            return False
+def make_const_enum(enum_id, hash_value, ea=None):
+    if ea is None:
+        ea = idc.here()
+    def apply_to_ea(target_ea):
+        count = 0
+        if not idc.is_code(idc.get_full_flags(target_ea)):
+            if ida_bytes.op_enum(target_ea, 0, enum_id, 0):
+                return 1
+            return 0
+        # Code items: check operands 0, 1, 2
+        for op_n in range(3):
+            if idc.get_operand_type(target_ea, op_n) == idc.o_void:
+                break
+            
+            op_val = idc.get_operand_value(target_ea, op_n)
+            if op_val == hash_value or (op_val & 0xFFFFFFFF) == (hash_value & 0xFFFFFFFF):
+                if ida_bytes.op_enum(target_ea, op_n, enum_id, 0):
+                    count += 1
+        return count
+    # Try to get the function bounds to replace ALL occurrences in the function
+    func = idaapi.get_func(ea)
+    total_replacements = 0
+    if func:
+        # Iterate over all heads in the function
+        curr_ea = func.start_ea
+        while curr_ea < func.end_ea and curr_ea != idaapi.BADADDR:
+             total_replacements += apply_to_ea(curr_ea)
+             curr_ea = ida_bytes.next_head(curr_ea, func.end_ea)
     else:
-        ida_bytes.op_enum(start, 0, enum_id, 0)
+        # Not in a function 
+        total_replacements += apply_to_ea(ea)
+    return total_replacements > 0
 
 
 def parse_highlighted_value():
@@ -1140,8 +1156,8 @@ def parse_highlighted_value():
         raise HashDBError("Invalid selection; did you manually range-select a value, or double-click a value?")
 
     # Handle various number formats
-    match = re.match(r"^(?P<sign>[-+])?(?P<prefix>0|0x)?(?P<number>[0-9A-F]+)(?P<suffix>b|o|h|u|i64|ui64)?$",
-                     identifier)
+    match = re.match(r"^(?P<sign>[-+])?(?P<prefix>0x|0)?(?P<number>[0-9A-F]+)(?P<suffix>u|l|ll|ul|ull|b|o|h|i64|ui64)?$",
+                     identifier, re.IGNORECASE)
     if match is None:
         raise HashDBError(f"Failed to parse the value {identifier!r}, please submit a bug report.")
 
@@ -1289,6 +1305,77 @@ def determine_algorithm_size(algorithm_type: str) -> str:
     return size
 
 
+def apply_bulk_enums(enum_id, enum_list):
+    """
+    Scans the current function and applies any hash found in enum_list.
+    """
+    # 1. Determine context and finding the function address
+    ea = idaapi.BADADDR
+    view = ida_kernwin.get_current_viewer()
+    
+    if ida_kernwin.get_viewer_place_type(view) == ida_kernwin.TCCPT_IDAPLACE:
+        ea = idc.here()
+    elif idaapi.init_hexrays_plugin():
+        import ida_hexrays
+        widget = ida_kernwin.get_current_widget()
+        if widget:
+            vdui = ida_hexrays.get_widget_vdui(widget)
+            # Search fallback if focus lost
+            if not vdui:
+                for c in "ABCDE":
+                    w = ida_kernwin.find_widget(f"Pseudocode-{c}")
+                    if w and ida_kernwin.is_visible(w):
+                        vdui = ida_hexrays.get_widget_vdui(w)
+                        if vdui: break
+            if vdui:
+                try:
+                    ea = vdui.cfunc.entry_ea
+                except:
+                    pass
+
+    if ea == idaapi.BADADDR:
+        return 0
+
+    func = idaapi.get_func(ea)
+    if not func:
+        return 0
+
+    # 2. Prepare lookup sets
+    # enum_list items are (name, value, is_api)
+    hashes_strict = set()
+    hashes_32 = set()
+    
+    for _, val, _ in enum_list:
+        hashes_strict.add(val)
+        hashes_32.add(val & 0xFFFFFFFF)
+
+    # 3. Iterate instructions
+    count = 0
+    curr_ea = func.start_ea
+    while curr_ea < func.end_ea and curr_ea != idaapi.BADADDR:
+        # Check operands 0, 1, 2
+        for op_n in range(3):
+            if idc.get_operand_type(curr_ea, op_n) == idc.o_void:
+                break
+            
+            val = idc.get_operand_value(curr_ea, op_n)
+            
+            # Check match
+            match = False
+            if val in hashes_strict:
+                match = True
+            elif (val & 0xFFFFFFFF) in hashes_32:
+                match = True
+            
+            if match:
+                if ida_bytes.op_enum(curr_ea, op_n, enum_id, 0):
+                    count += 1
+        
+        curr_ea = ida_bytes.next_head(curr_ea, func.end_ea)
+        
+    return count
+
+
 #--------------------------------------------------------------------------
 # Set xor key
 #--------------------------------------------------------------------------
@@ -1376,10 +1463,40 @@ def hash_lookup_done_handler(hash_list: Union[None, list], hash_value: int = Non
     
     # If the hash was pulled from the disassembly window
     # make the constant an enum 
-    # TODO: I don't know how to do this in the decompiler window
     def make_const_enum_wrapper(enum_id, hash_value):
-        if ida_kernwin.get_viewer_place_type(ida_kernwin.get_current_viewer()) == ida_kernwin.TCCPT_IDAPLACE:
-            make_const_enum(enum_id, hash_value)
+        view = ida_kernwin.get_current_viewer()
+        if ida_kernwin.get_viewer_place_type(view) == ida_kernwin.TCCPT_IDAPLACE:
+            if make_const_enum(enum_id, hash_value):
+                ida_kernwin.request_refresh(ida_kernwin.IWID_ALL)
+        # handle Decompiler view
+        elif idaapi.init_hexrays_plugin():
+            import ida_hexrays
+            vdui = None
+            widget = ida_kernwin.get_current_widget()
+            if widget:
+                vdui = ida_hexrays.get_widget_vdui(widget)
+            # If not found, search for visible decompiler views
+            if not vdui:
+                for c in "ABCDE":
+                    w = ida_kernwin.find_widget(f"Pseudocode-{c}")
+                    if w and ida_kernwin.is_visible(w):
+                        vdui = ida_hexrays.get_widget_vdui(w)
+                        if vdui: break
+            if vdui:
+                 if vdui.item and vdui.item.citype == ida_hexrays.VDI_EXPR and vdui.item.e and vdui.item.e.op == ida_hexrays.cot_num:
+                      ea = vdui.item.e.ea                      
+                      if ea == idaapi.BADADDR:
+                          ea = vdui.cfunc.entry_ea
+                      
+                      if ea != idaapi.BADADDR:
+                            if make_const_enum(enum_id, hash_value, ea):
+                                # Force a clean refresh of the decompiler view and Try Force recompilation
+                                try:
+                                    ida_hexrays.mark_cfunc_dirty(vdui.cfunc.entry_ea, False)
+                                except:
+                                    pass
+                                vdui.refresh_view(True)
+                                ida_kernwin.request_refresh(ida_kernwin.IWID_ALL)
         return 0 # execute_sync dictates an int return value
     
     make_const_enum_wrapper_callable = functools.partial(make_const_enum_wrapper, enum_id, hash_value)
@@ -1389,46 +1506,85 @@ def hash_lookup_done_handler(hash_list: Union[None, list], hash_value: int = Non
     if not hash_string.get("is_api", False):
         return
 
-    # Execute the api_import_select_t form on the main thread
-    def api_import_select_show(string_value, module_list) -> int:
-        nonlocal module_name
-        module_name = api_import_select_t.show(string_value, module_list)
-        return 0 # execute_sync dictates an int return value
+    # Check if we already imported this module
+    global IMPORTED_MODULES
+    potential_modules = set(hash_string.get("modules", []))
+    if not potential_modules.intersection(IMPORTED_MODULES):
+        # Execute the api_import_select_t form on the main thread
+        def api_import_select_show(string_value, module_list) -> int:
+            nonlocal module_name
+            module_name = api_import_select_t.show(string_value, module_list)
+            return 0 
+        module_name = None
+        api_import_select_callable = functools.partial(api_import_select_show, string_value, hash_string.get("modules", []))
+        ida_kernwin.execute_sync(api_import_select_callable, ida_kernwin.MFF_FAST)
+        if module_name is None:
+            return
+        IMPORTED_MODULES.add(module_name)
+        # Import all of the hashes from the module and permutation
+        module_hash_list = None
+        try:
+            global HASHDB_ALGORITHM, HASHDB_API_URL, HASHDB_REQUEST_TIMEOUT
+            module_hash_list = get_module_hashes(module_name, HASHDB_ALGORITHM, hash_string.get("permutation", ""), HASHDB_API_URL, timeout=HASHDB_REQUEST_TIMEOUT)
+        except requests.Timeout:
+            idaapi.msg("ERROR: HashDB API module hashes request timed out.\n")
+            logging.exception("API request to {} timed out.".format(HASHDB_API_URL))
+            return
+        global HASHDB_USE_XOR, HASHDB_XOR_VALUE
+        enum_list = []
+        for hash_entry in module_hash_list.get("hashes", []):
+            hash = hash_entry.get("hash", 0)
+            string_object = hash_entry.get("string", {})
+            enum_list.append((string_object.get("api", string_object.get("string", "")), 
+                            hash ^ HASHDB_XOR_VALUE if HASHDB_USE_XOR else hash, 
+                            True)) 
+    else:
+        # Already imported, treat as if we have the list from the existing enum
+        # We need to construct a list from the current enum to perform the bulk apply
+        # This is a bit computationally expensive if the enum is huge, but safe.
+        enum_name = generate_enum_name(ENUM_PREFIX)
+        existing_values = get_existing_enum_values(enum_name)
+        enum_list = [(k, v, True) for k, v in existing_values.items()]
+        module_name = "cached modules"
 
-    module_name = None
-    api_import_select_callable = functools.partial(api_import_select_show, string_value, hash_string.get("modules", []))
-    ida_kernwin.execute_sync(api_import_select_callable, ida_kernwin.MFF_FAST)
-    if module_name is None:
-        return
-
-    # Import all of the hashes from the module and permutation
-    module_hash_list = None
-    try:
-        global HASHDB_ALGORITHM, HASHDB_API_URL, HASHDB_REQUEST_TIMEOUT
-        module_hash_list = get_module_hashes(module_name, HASHDB_ALGORITHM, hash_string.get("permutation", ""), HASHDB_API_URL, timeout=HASHDB_REQUEST_TIMEOUT)
-    except requests.Timeout:
-        idaapi.msg("ERROR: HashDB API module hashes request timed out.\n")
-        logging.exception("API request to {} timed out.".format(HASHDB_API_URL))
-        return
-
-    # Add the hash list to the global enum
-    global HASHDB_USE_XOR, HASHDB_XOR_VALUE
-    enum_list = []
-    for hash_entry in module_hash_list.get("hashes", []):
-        hash = hash_entry.get("hash", 0)
-        string_object = hash_entry.get("string", {})
-        enum_list.append((string_object.get("api", string_object.get("string", "")), # name
-                         hash ^ HASHDB_XOR_VALUE if HASHDB_USE_XOR else hash, # hash_value
-                         True)) # is_api
-    
-    # Add hashes to enum
+    # Add hashes to enum (if new) and apply bulk
     enum_id = None
     add_enums_callable = functools.partial(add_enums_wrapper, generate_enum_name(ENUM_PREFIX), enum_list)
     ida_kernwin.execute_sync(add_enums_callable, ida_kernwin.MFF_FAST)
     if enum_id is None:
         idaapi.msg("ERROR: Unable to create or find enum: {}\n".format(generate_enum_name(ENUM_PREFIX)))
     else:
-        idaapi.msg("HashDB: Added {} hashes for module {}\n".format(len(enum_list), module_name))
+        if module_name != "cached modules":
+            idaapi.msg("HashDB: Added {} hashes for module {}\n".format(len(enum_list), module_name))
+        
+        # Apply bulk enums to current function
+        def apply_bulk_wrapper(enum_id, enum_list):
+             count = apply_bulk_enums(enum_id, enum_list)
+             if count > 0:
+                 idaapi.msg(f"HashDB: Bulk updated {count} operands in the current function.\n")
+                 ida_kernwin.request_refresh(ida_kernwin.IWID_ALL)
+                 if idaapi.init_hexrays_plugin():
+                    import ida_hexrays
+                    widget = ida_kernwin.get_current_widget()
+                    vdui = None
+                    if widget:
+                        vdui = ida_hexrays.get_widget_vdui(widget)
+                    if not vdui:
+                        for c in "ABCDE":
+                            w = ida_kernwin.find_widget(f"Pseudocode-{c}")
+                            if w and ida_kernwin.is_visible(w):
+                                vdui = ida_hexrays.get_widget_vdui(w)
+                                if vdui: break
+                    if vdui:
+                        try:
+                            ida_hexrays.mark_cfunc_dirty(vdui.cfunc.entry_ea, False)
+                            vdui.refresh_view(True)
+                        except:
+                            pass
+             return 0
+
+        apply_bulk_callable = functools.partial(apply_bulk_wrapper, enum_id, enum_list)
+        ida_kernwin.execute_sync(apply_bulk_callable, ida_kernwin.MFF_FAST)
 
 
 def hash_lookup_done(hash_list: Union[None, list] = None, hash_value: int = None):
