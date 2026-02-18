@@ -1349,27 +1349,25 @@ def apply_bulk_enums(enum_id, enum_list):
 
     # 3. Iterate instructions
     count = 0
-    curr_ea = func.start_ea
-    while curr_ea < func.end_ea and curr_ea != idaapi.BADADDR:
-        # Check operands 0, 1, 2
-        for op_n in range(3):
-            if idc.get_operand_type(curr_ea, op_n) == idc.o_void:
-                break
-            
-            val = idc.get_operand_value(curr_ea, op_n)
-            
-            # Check match
-            match = False
-            if val in hashes_strict:
-                match = True
-            elif (val & 0xFFFFFFFF) in hashes_32:
-                match = True
-            
-            if match:
-                if ida_bytes.op_enum(curr_ea, op_n, enum_id, 0):
-                    count += 1
-        
-        curr_ea = ida_bytes.next_head(curr_ea, func.end_ea)
+    for chunk_start, chunk_end in idautils.Chunks(func.start_ea):
+        for head in idautils.Heads(chunk_start, chunk_end):
+            # Check operands 0, 1, 2
+            for op_n in range(3):
+                if idc.get_operand_type(head, op_n) == idc.o_void:
+                    break
+                
+                val = idc.get_operand_value(head, op_n)
+                
+                # Check match
+                match = False
+                if val in hashes_strict:
+                    match = True
+                elif (val & 0xFFFFFFFF) in hashes_32:
+                    match = True
+                
+                if match:
+                    if ida_bytes.op_enum(head, op_n, enum_id, 0):
+                        count += 1
         
     return count
 
