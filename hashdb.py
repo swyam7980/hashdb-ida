@@ -1129,11 +1129,9 @@ def make_const_enum(enum_id, hash_value, ea=None):
     func = idaapi.get_func(ea)
     total_replacements = 0
     if func:
-        # Iterate over all heads in the function
-        curr_ea = func.start_ea
-        while curr_ea < func.end_ea and curr_ea != idaapi.BADADDR:
-             total_replacements += apply_to_ea(curr_ea)
-             curr_ea = ida_bytes.next_head(curr_ea, func.end_ea)
+        for chunk_start, chunk_end in idautils.Chunks(func.start_ea):
+            for head in idautils.Heads(chunk_start, chunk_end):
+                total_replacements += apply_to_ea(curr_ea)
     else:
         # Not in a function 
         total_replacements += apply_to_ea(ea)
