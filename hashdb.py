@@ -255,7 +255,174 @@ NETNODE_NAME = "$hashdb"
 # Variables for async operations
 HASHDB_REQUEST_TIMEOUT = 15 # Limit to 15 seconds
 HASHDB_REQUEST_LOCK = threading.Lock()
-IMPORTED_MODULES = set() 
+class _ImportManager:
+    """Manage imported modules state to avoid global mutable state spread.
+
+    This encapsulates the set of already-imported modules so the rest of
+    the code can use a bound method and avoid touching a module-level
+    global set directly.
+    """
+    def __init__(self):
+        self.imported_modules = set()
+
+    def hash_lookup_done_handler(self, hash_list: Union[None, list], hash_value: int = None):
+        """Bound handler that was previously a free function.
+
+        The implementation is the same as the original `hash_lookup_done_handler`
+        but uses `self.imported_modules` instead of a global.
+        """
+        global ENUM_PREFIX
+        def add_enums_wrapper(enum_name, hash_list):
+            nonlocal enum_id
+            enum_id = add_enums(enum_name, hash_list)
+            return 0 # execute_sync dictates an int return value
+
+        if hash_list is None or hash_value is None:
+            return
+
+        # Parse the hash list
+        hash_string = None
+        if len(hash_list) == 1:
+            hash_string = hash_list[0].get("string", {})
+        else:
+            # Multiple hashes found, allow the user to
+            #  select the best match
+            collisions = {}
+            for string_match in hash_list:
+                string_value = string_match.get("string", {})
+                if string_value.get('is_api', False):
+                    collisions[string_value.get("api", "")] = string_value
+                else:
+                    collisions[string_value.get("string", "")] = string_value
+            
+            # Execute the match_select_t form on the main thread
+            def match_select_show(collision_strings):
+                nonlocal selected_string
+                selected_string = match_select_t.show(collision_strings)
+                return 0 # execute_sync dictates an int return value
+
+            selected_string = None
+            match_select_callable = functools.partial(match_select_show, [*collisions.keys()])
+            ida_kernwin.execute_sync(match_select_callable, ida_kernwin.MFF_FAST)
+            if selected_string is None:
+                return
+            
+            hash_string = collisions[selected_string]
+        
+        # Parse the string from the hash_string match
+        string_value = ""
+        if hash_string.get("is_api", False):
+            string_value = hash_string.get("api", "")
+        else:
+            string_value = hash_string.get("string", "")
+
+        # Handle empty string values
+        if not len(string_value):
+            string_value = "empty_string"
+
+        # Hash found!
+        idaapi.msg("HashDB: Hash match found: {}\n".format(string_value))
+
+        # Add the hash to the global enum, and exit if we can't create it
+        enum_id = None
+        add_enums_callable = functools.partial(add_enums_wrapper, generate_enum_name(ENUM_PREFIX), [(string_value, hash_value, hash_string.get("is_api", False))])
+        ida_kernwin.execute_sync(add_enums_callable, ida_kernwin.MFF_FAST)
+        if enum_id is None:
+            idaapi.msg("ERROR: Unable to create or find enum: {}\n".format(generate_enum_name(ENUM_PREFIX)))
+            return
+        
+        # If the hash was pulled from the disassembly window
+        # make the constant an enum 
+        def make_const_enum_wrapper(enum_id, hash_value):
+            view = ida_kernwin.get_current_viewer()
+            if ida_kernwin.get_viewer_place_type(view) == ida_kernwin.TCCPT_IDAPLACE:
+                if make_const_enum(enum_id, hash_value):
+                    ida_kernwin.request_refresh(ida_kernwin.IWID_ALL)
+            # handle Decompiler view
+            else:
+                vdui = _find_hexrays_vdui()
+                if vdui:
+                    ea = _get_ea_from_vdui(vdui)
+                    if ea != idaapi.BADADDR:
+                        if make_const_enum(enum_id, hash_value, ea):
+                            _refresh_vdui_if_present(vdui)
+            return 0 # execute_sync dictates an int return value
+        
+        make_const_enum_wrapper_callable = functools.partial(make_const_enum_wrapper, enum_id, hash_value)
+        ida_kernwin.execute_sync(make_const_enum_wrapper_callable, ida_kernwin.MFF_FAST)
+
+        # Handle API hashes
+        if not hash_string.get("is_api", False):
+            return
+
+        # Check if we already imported this module
+        potential_modules = set(hash_string.get("modules", []))
+        if not potential_modules.intersection(self.imported_modules):
+            # Execute the api_import_select_t form on the main thread
+            def api_import_select_show(string_value, module_list) -> int:
+                nonlocal module_name
+                module_name = api_import_select_t.show(string_value, module_list)
+                return 0 
+            module_name = None
+            api_import_select_callable = functools.partial(api_import_select_show, string_value, hash_string.get("modules", []))
+            ida_kernwin.execute_sync(api_import_select_callable, ida_kernwin.MFF_FAST)
+            if module_name is None:
+                return
+            self.imported_modules.add(module_name)
+            # Import all of the hashes from the module and permutation
+            module_hash_list = None
+            try:
+                global HASHDB_ALGORITHM, HASHDB_API_URL, HASHDB_REQUEST_TIMEOUT
+                module_hash_list = get_module_hashes(module_name, HASHDB_ALGORITHM, hash_string.get("permutation", ""), HASHDB_API_URL, timeout=HASHDB_REQUEST_TIMEOUT)
+            except requests.Timeout:
+                idaapi.msg("ERROR: HashDB API module hashes request timed out.\n")
+                logging.exception("API request to {} timed out.".format(HASHDB_API_URL))
+                return
+            global HASHDB_USE_XOR, HASHDB_XOR_VALUE
+            enum_list = []
+            for hash_entry in module_hash_list.get("hashes", []):
+                hash = hash_entry.get("hash", 0)
+                string_object = hash_entry.get("string", {})
+                enum_list.append((string_object.get("api", string_object.get("string", "")), 
+                                hash ^ HASHDB_XOR_VALUE if HASHDB_USE_XOR else hash, 
+                                True)) 
+        else:
+            # Already imported, treat as if we have the list from the existing enum
+            # We need to construct a list from the current enum to perform the bulk apply
+            # This is a bit computationally expensive if the enum is huge, but safe.
+            enum_name = generate_enum_name(ENUM_PREFIX)
+            existing_values = get_existing_enum_values(enum_name)
+            enum_list = [(k, v, True) for k, v in existing_values.items()]
+            module_name = "cached modules"
+
+        # Add hashes to enum (if new) and apply bulk
+        enum_id = None
+        add_enums_callable = functools.partial(add_enums_wrapper, generate_enum_name(ENUM_PREFIX), enum_list)
+        ida_kernwin.execute_sync(add_enums_callable, ida_kernwin.MFF_FAST)
+        if enum_id is None:
+            idaapi.msg("ERROR: Unable to create or find enum: {}\n".format(generate_enum_name(ENUM_PREFIX)))
+        else:
+            if module_name != "cached modules":
+                idaapi.msg("HashDB: Added {} hashes for module {}\n".format(len(enum_list), module_name))
+            
+            # Apply bulk enums to current function
+            def apply_bulk_wrapper(enum_id, enum_list):
+                 count = apply_bulk_enums(enum_id, enum_list)
+                 if count > 0:
+                     idaapi.msg(f"HashDB: Bulk updated {count} operands in the current function.\n")
+                     ida_kernwin.request_refresh(ida_kernwin.IWID_ALL)
+                     vdui = _find_hexrays_vdui()
+                     if vdui:
+                         _refresh_vdui_if_present(vdui)
+                 return 0
+
+            apply_bulk_callable = functools.partial(apply_bulk_wrapper, enum_id, enum_list)
+            ida_kernwin.execute_sync(apply_bulk_callable, ida_kernwin.MFF_FAST)
+
+
+# Instantiate the import manager used by the rest of the module
+IMPORT_MANAGER = _ImportManager()
+
 
 #--------------------------------------------------------------------------
 # Setup Icon
@@ -1414,7 +1581,7 @@ def _get_ea_from_vdui(vdui):
 
 
 def _refresh_vdui_if_present(vdui):
-    """Mark a vdui's cfunc dirty and refresh the view. HANDLER"""
+    """Mark a vdui's cfunc dirty and refresh the view."""
     if vdui is None:
         return
     try:
@@ -1455,159 +1622,7 @@ def set_xor_key():
 #--------------------------------------------------------------------------
 # Hash lookup
 #--------------------------------------------------------------------------
-def hash_lookup_done_handler(hash_list: Union[None, list], hash_value: int = None):
-    global ENUM_PREFIX
-    def add_enums_wrapper(enum_name, hash_list):
-        nonlocal enum_id
-        enum_id = add_enums(enum_name, hash_list)
-        return 0 # execute_sync dictates an int return value
-    
-    if hash_list is None or hash_value is None:
-        return
-
-    # Parse the hash list
-    hash_string = None
-    if len(hash_list) == 1:
-        hash_string = hash_list[0].get("string", {})
-    else:
-        # Multiple hashes found, allow the user to
-        #  select the best match
-        collisions = {}
-        for string_match in hash_list:
-            string_value = string_match.get("string", {})
-            if string_value.get('is_api', False):
-                collisions[string_value.get("api", "")] = string_value
-            else:
-                collisions[string_value.get("string", "")] = string_value
-        
-        # Execute the match_select_t form on the main thread
-        def match_select_show(collision_strings):
-            nonlocal selected_string
-            selected_string = match_select_t.show(collision_strings)
-            return 0 # execute_sync dictates an int return value
-
-        selected_string = None
-        match_select_callable = functools.partial(match_select_show, [*collisions.keys()])
-        ida_kernwin.execute_sync(match_select_callable, ida_kernwin.MFF_FAST)
-        if selected_string is None:
-            return
-        
-        hash_string = collisions[selected_string]
-    
-    # Parse the string from the hash_string match
-    string_value = ""
-    if hash_string.get("is_api", False):
-        string_value = hash_string.get("api", "")
-    else:
-        string_value = hash_string.get("string", "")
-
-    # Handle empty string values
-    if not len(string_value):
-        string_value = "empty_string"
-
-    # Hash found!
-    idaapi.msg("HashDB: Hash match found: {}\n".format(string_value))
-
-    # Add the hash to the global enum, and exit if we can't create it
-    enum_id = None
-    add_enums_callable = functools.partial(add_enums_wrapper, generate_enum_name(ENUM_PREFIX), [(string_value, hash_value, hash_string.get("is_api", False))])
-    ida_kernwin.execute_sync(add_enums_callable, ida_kernwin.MFF_FAST)
-    if enum_id is None:
-        idaapi.msg("ERROR: Unable to create or find enum: {}\n".format(generate_enum_name(ENUM_PREFIX)))
-        return
-    
-    # If the hash was pulled from the disassembly window
-    # make the constant an enum 
-    # NOTE: The decompiler (Hex-Rays) discovery / refresh logic used below
-    # was duplicated in multiple places. It has been factored into the
-    # helper functions: `_find_hexrays_vdui`, `_get_ea_from_vdui`, and
-    # `_refresh_vdui_if_present` for reuse and readability.
-    def make_const_enum_wrapper(enum_id, hash_value):
-        view = ida_kernwin.get_current_viewer()
-        if ida_kernwin.get_viewer_place_type(view) == ida_kernwin.TCCPT_IDAPLACE:
-            if make_const_enum(enum_id, hash_value):
-                ida_kernwin.request_refresh(ida_kernwin.IWID_ALL)
-        # handle Decompiler view
-        else:
-            vdui = _find_hexrays_vdui()
-            if vdui:
-                ea = _get_ea_from_vdui(vdui)
-                if ea != idaapi.BADADDR:
-                    if make_const_enum(enum_id, hash_value, ea):
-                        _refresh_vdui_if_present(vdui)
-        return 0 # execute_sync dictates an int return value
-    
-    make_const_enum_wrapper_callable = functools.partial(make_const_enum_wrapper, enum_id, hash_value)
-    ida_kernwin.execute_sync(make_const_enum_wrapper_callable, ida_kernwin.MFF_FAST)
-
-    # Handle API hashes
-    if not hash_string.get("is_api", False):
-        return
-
-    # Check if we already imported this module
-    global IMPORTED_MODULES
-    potential_modules = set(hash_string.get("modules", []))
-    if not potential_modules.intersection(IMPORTED_MODULES):
-        # Execute the api_import_select_t form on the main thread
-        def api_import_select_show(string_value, module_list) -> int:
-            nonlocal module_name
-            module_name = api_import_select_t.show(string_value, module_list)
-            return 0 
-        module_name = None
-        api_import_select_callable = functools.partial(api_import_select_show, string_value, hash_string.get("modules", []))
-        ida_kernwin.execute_sync(api_import_select_callable, ida_kernwin.MFF_FAST)
-        if module_name is None:
-            return
-        IMPORTED_MODULES.add(module_name)
-        # Import all of the hashes from the module and permutation
-        module_hash_list = None
-        try:
-            global HASHDB_ALGORITHM, HASHDB_API_URL, HASHDB_REQUEST_TIMEOUT
-            module_hash_list = get_module_hashes(module_name, HASHDB_ALGORITHM, hash_string.get("permutation", ""), HASHDB_API_URL, timeout=HASHDB_REQUEST_TIMEOUT)
-        except requests.Timeout:
-            idaapi.msg("ERROR: HashDB API module hashes request timed out.\n")
-            logging.exception("API request to {} timed out.".format(HASHDB_API_URL))
-            return
-        global HASHDB_USE_XOR, HASHDB_XOR_VALUE
-        enum_list = []
-        for hash_entry in module_hash_list.get("hashes", []):
-            hash = hash_entry.get("hash", 0)
-            string_object = hash_entry.get("string", {})
-            enum_list.append((string_object.get("api", string_object.get("string", "")), 
-                            hash ^ HASHDB_XOR_VALUE if HASHDB_USE_XOR else hash, 
-                            True)) 
-    else:
-        # Already imported, treat as if we have the list from the existing enum
-        # We need to construct a list from the current enum to perform the bulk apply
-        # This is a bit computationally expensive if the enum is huge, but safe.
-        enum_name = generate_enum_name(ENUM_PREFIX)
-        existing_values = get_existing_enum_values(enum_name)
-        enum_list = [(k, v, True) for k, v in existing_values.items()]
-        module_name = "cached modules"
-
-    # Add hashes to enum (if new) and apply bulk
-    enum_id = None
-    add_enums_callable = functools.partial(add_enums_wrapper, generate_enum_name(ENUM_PREFIX), enum_list)
-    ida_kernwin.execute_sync(add_enums_callable, ida_kernwin.MFF_FAST)
-    if enum_id is None:
-        idaapi.msg("ERROR: Unable to create or find enum: {}\n".format(generate_enum_name(ENUM_PREFIX)))
-    else:
-        if module_name != "cached modules":
-            idaapi.msg("HashDB: Added {} hashes for module {}\n".format(len(enum_list), module_name))
-        
-        # Apply bulk enums to current function
-        def apply_bulk_wrapper(enum_id, enum_list):
-             count = apply_bulk_enums(enum_id, enum_list)
-             if count > 0:
-                 idaapi.msg(f"HashDB: Bulk updated {count} operands in the current function.\n")
-                 ida_kernwin.request_refresh(ida_kernwin.IWID_ALL)
-                 vdui = _find_hexrays_vdui()
-                 if vdui:
-                     _refresh_vdui_if_present(vdui)
-             return 0
-
-        apply_bulk_callable = functools.partial(apply_bulk_wrapper, enum_id, enum_list)
-        ida_kernwin.execute_sync(apply_bulk_callable, ida_kernwin.MFF_FAST)
+hash_lookup_done_handler = IMPORT_MANAGER.hash_lookup_done_handler
 
 
 def hash_lookup_done(hash_list: Union[None, list] = None, hash_value: int = None):
