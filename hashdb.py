@@ -63,6 +63,7 @@ else:
 
 import idc
 import ida_kernwin
+import idautils
 import ida_name
 import ida_bytes
 import ida_netnode
@@ -1131,7 +1132,7 @@ def make_const_enum(enum_id, hash_value, ea=None):
     if func:
         for chunk_start, chunk_end in idautils.Chunks(func.start_ea):
             for head in idautils.Heads(chunk_start, chunk_end):
-                total_replacements += apply_to_ea(curr_ea)
+                total_replacements += apply_to_ea(head)
     else:
         # Not in a function 
         total_replacements += apply_to_ea(ea)
@@ -1313,23 +1314,13 @@ def apply_bulk_enums(enum_id, enum_list):
     
     if ida_kernwin.get_viewer_place_type(view) == ida_kernwin.TCCPT_IDAPLACE:
         ea = idc.here()
-    elif idaapi.init_hexrays_plugin():
-        import ida_hexrays
-        widget = ida_kernwin.get_current_widget()
-        if widget:
-            vdui = ida_hexrays.get_widget_vdui(widget)
-            # Search fallback if focus lost
-            if not vdui:
-                for c in "ABCDE":
-                    w = ida_kernwin.find_widget(f"Pseudocode-{c}")
-                    if w and ida_kernwin.is_visible(w):
-                        vdui = ida_hexrays.get_widget_vdui(w)
-                        if vdui: break
-            if vdui:
-                try:
-                    ea = vdui.cfunc.entry_ea
-                except:
-                    pass
+    else:
+        vdui = _find_hexrays_vdui()
+        if vdui:
+            try:
+                ea = _get_ea_from_vdui(vdui)
+            except Exception:
+                pass
 
     if ea == idaapi.BADADDR:
         return 0
@@ -1370,6 +1361,74 @@ def apply_bulk_enums(enum_id, enum_list):
                         count += 1
         
     return count
+
+
+def _find_hexrays_vdui():
+    """Find and return a Hex-Rays vdui instance if available, otherwise None."""
+    if not idaapi.init_hexrays_plugin():
+        return None
+    try:
+        import ida_hexrays
+    except Exception:
+        return None
+
+    widget = ida_kernwin.get_current_widget()
+    vdui = None
+    if widget:
+        try:
+            vdui = ida_hexrays.get_widget_vdui(widget)
+        except Exception:
+            vdui = None
+
+    if not vdui:
+        for c in "ABCDE":
+            w = ida_kernwin.find_widget(f"Pseudocode-{c}")
+            if w and ida_kernwin.is_visible(w):
+                try:
+                    vdui = ida_hexrays.get_widget_vdui(w)
+                except Exception:
+                    vdui = None
+                if vdui:
+                    break
+
+    return vdui
+
+
+def _get_ea_from_vdui(vdui):
+    """Return a sensible EA from a vdui (selected expression EA or function entry), or BADADDR."""
+    if vdui is None:
+        return idaapi.BADADDR
+    try:
+        import ida_hexrays
+        if vdui.item and vdui.item.citype == ida_hexrays.VDI_EXPR and vdui.item.e and vdui.item.e.op == ida_hexrays.cot_num:
+            ea = vdui.item.e.ea
+            if ea == idaapi.BADADDR:
+                return vdui.cfunc.entry_ea
+            return ea
+    except Exception:
+        pass
+    try:
+        return vdui.cfunc.entry_ea
+    except Exception:
+        return idaapi.BADADDR
+
+
+def _refresh_vdui_if_present(vdui):
+    """Mark a vdui's cfunc dirty and refresh the view. HANDLER"""
+    if vdui is None:
+        return
+    try:
+        import ida_hexrays
+        try:
+            ida_hexrays.mark_cfunc_dirty(vdui.cfunc.entry_ea, False)
+        except Exception:
+            pass
+        try:
+            vdui.refresh_view(True)
+        except Exception:
+            pass
+    except Exception:
+        return
 
 
 #--------------------------------------------------------------------------
@@ -1459,40 +1518,23 @@ def hash_lookup_done_handler(hash_list: Union[None, list], hash_value: int = Non
     
     # If the hash was pulled from the disassembly window
     # make the constant an enum 
+    # NOTE: The decompiler (Hex-Rays) discovery / refresh logic used below
+    # was duplicated in multiple places. It has been factored into the
+    # helper functions: `_find_hexrays_vdui`, `_get_ea_from_vdui`, and
+    # `_refresh_vdui_if_present` for reuse and readability.
     def make_const_enum_wrapper(enum_id, hash_value):
         view = ida_kernwin.get_current_viewer()
         if ida_kernwin.get_viewer_place_type(view) == ida_kernwin.TCCPT_IDAPLACE:
             if make_const_enum(enum_id, hash_value):
                 ida_kernwin.request_refresh(ida_kernwin.IWID_ALL)
         # handle Decompiler view
-        elif idaapi.init_hexrays_plugin():
-            import ida_hexrays
-            vdui = None
-            widget = ida_kernwin.get_current_widget()
-            if widget:
-                vdui = ida_hexrays.get_widget_vdui(widget)
-            # If not found, search for visible decompiler views
-            if not vdui:
-                for c in "ABCDE":
-                    w = ida_kernwin.find_widget(f"Pseudocode-{c}")
-                    if w and ida_kernwin.is_visible(w):
-                        vdui = ida_hexrays.get_widget_vdui(w)
-                        if vdui: break
+        else:
+            vdui = _find_hexrays_vdui()
             if vdui:
-                 if vdui.item and vdui.item.citype == ida_hexrays.VDI_EXPR and vdui.item.e and vdui.item.e.op == ida_hexrays.cot_num:
-                      ea = vdui.item.e.ea                      
-                      if ea == idaapi.BADADDR:
-                          ea = vdui.cfunc.entry_ea
-                      
-                      if ea != idaapi.BADADDR:
-                            if make_const_enum(enum_id, hash_value, ea):
-                                # Force a clean refresh of the decompiler view and Try Force recompilation
-                                try:
-                                    ida_hexrays.mark_cfunc_dirty(vdui.cfunc.entry_ea, False)
-                                except:
-                                    pass
-                                vdui.refresh_view(True)
-                                ida_kernwin.request_refresh(ida_kernwin.IWID_ALL)
+                ea = _get_ea_from_vdui(vdui)
+                if ea != idaapi.BADADDR:
+                    if make_const_enum(enum_id, hash_value, ea):
+                        _refresh_vdui_if_present(vdui)
         return 0 # execute_sync dictates an int return value
     
     make_const_enum_wrapper_callable = functools.partial(make_const_enum_wrapper, enum_id, hash_value)
@@ -1559,24 +1601,9 @@ def hash_lookup_done_handler(hash_list: Union[None, list], hash_value: int = Non
              if count > 0:
                  idaapi.msg(f"HashDB: Bulk updated {count} operands in the current function.\n")
                  ida_kernwin.request_refresh(ida_kernwin.IWID_ALL)
-                 if idaapi.init_hexrays_plugin():
-                    import ida_hexrays
-                    widget = ida_kernwin.get_current_widget()
-                    vdui = None
-                    if widget:
-                        vdui = ida_hexrays.get_widget_vdui(widget)
-                    if not vdui:
-                        for c in "ABCDE":
-                            w = ida_kernwin.find_widget(f"Pseudocode-{c}")
-                            if w and ida_kernwin.is_visible(w):
-                                vdui = ida_hexrays.get_widget_vdui(w)
-                                if vdui: break
-                    if vdui:
-                        try:
-                            ida_hexrays.mark_cfunc_dirty(vdui.cfunc.entry_ea, False)
-                            vdui.refresh_view(True)
-                        except:
-                            pass
+                 vdui = _find_hexrays_vdui()
+                 if vdui:
+                     _refresh_vdui_if_present(vdui)
              return 0
 
         apply_bulk_callable = functools.partial(apply_bulk_wrapper, enum_id, enum_list)
