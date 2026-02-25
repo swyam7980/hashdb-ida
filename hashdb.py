@@ -266,11 +266,7 @@ class _ImportManager:
         self.imported_modules = set()
 
     def hash_lookup_done_handler(self, hash_list: Union[None, list], hash_value: int = None):
-        """Bound handler that was previously a free function.
-
-        The implementation is the same as the original `hash_lookup_done_handler`
-        but uses `self.imported_modules` instead of a global.
-        """
+        """Receive, handle, and apply the results of a hash query."""
         global ENUM_PREFIX
         def add_enums_wrapper(enum_name, hash_list):
             nonlocal enum_id
